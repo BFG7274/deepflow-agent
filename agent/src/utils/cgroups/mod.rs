@@ -33,8 +33,16 @@ pub enum Error {
     CpuControllerSetFailed(String),
     #[error("set mem controller failed: {0}")]
     MemControllerSetFailed(String),
+    #[error("set cpuset controller failed: {0}")]
+    CpusetControllerSetFailed(String),
     #[error("apply resources failed: {0}")]
     ApplyResourcesFailed(String),
     #[error("delete cgroups failed: {0}")]
     DeleteCgroupsFailed(String),
+    #[error("cgroup not exists: {0}")]
+    GetCgroupFailed(String),
+    #[error("set cpuset cpus failed: {0}")]
+    CpusetCpuSetFailed(String),
+    #[error("set cpuset mems failed: {0}")]
+    CpusetMemSetFailed(String),
 }

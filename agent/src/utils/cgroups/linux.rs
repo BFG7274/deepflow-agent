@@ -17,7 +17,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
-use std::{fs, process, thread};
+use std::{fs, io, process, thread};
 
 use super::Error;
 use crate::config::handler::EnvironmentAccess;
@@ -81,6 +81,14 @@ impl Cgroups {
                 )));
             }
         };
+        let cpuset: &cpuset::CpuSetController = match cg.controller_of() {
+            Some(controller) => controller,
+            None => {
+                return Err(Error::CpusetControllerSetFailed(format!(
+                    "maybe cgroups is not installed"
+                )));
+            }
+        };
 
         if !is_cgroup_procs_writable() {
             // In kernel versions before Linux 3.0, we use add_task method, write thread id to the tasks file
@@ -91,6 +99,9 @@ impl Cgroups {
             if let Err(e) = mem.add_task(&CgroupPid::from(pid)) {
                 return Err(Error::MemControllerSetFailed(e.to_string()));
             }
+            if let Err(e) = cpuset.add_task(&CgroupPid::from(pid)) {
+                return Err(Error::CpusetControllerSetFailed(e.to_string()));
+            }
         } else {
             // In versions after Linux 3.0, we call the add_task_by_tgid method, which will
             // write the pid to the cgroup.procs file, so cgroups will automatically synchronize
@@ -100,6 +111,9 @@ impl Cgroups {
             }
             if let Err(e) = mem.add_task_by_tgid(&CgroupPid::from(pid)) {
                 return Err(Error::MemControllerSetFailed(e.to_string()));
+            }
+            if let Err(e) = cpuset.add_task_by_tgid(&CgroupPid::from(pid)) {
+                return Err(Error::CpusetControllerSetFailed(e.to_string()));
             }
         }
 
@@ -193,6 +207,27 @@ impl Cgroups {
         if let Err(e) = cgroup.apply(&resources) {
             return Err(Error::ApplyResourcesFailed(e.to_string()));
         }
+
+        let cpuset_data = match get_cgroup_cpuset("") {
+            Ok(data) => data,
+            Err(e) => {
+                return Err(Error::GetCgroupFailed(e.to_string()));
+            }
+        };
+        let cpuset: &cpuset::CpuSetController = match cgroup.controller_of() {
+            Some(controller) => controller,
+            None => {
+                return Err(Error::CpusetControllerSetFailed(format!(
+                    "maybe cgroups is not installed"
+                )));
+            }
+        };
+        if let Err(e) = cpuset.set_mems(&cpuset_data[1].trim()) {
+            return Err(Error::CpusetMemSetFailed(e.to_string()));
+        }
+        if let Err(e) = cpuset.set_cpus(&cpuset_data[0].trim()) {
+            return Err(Error::CpusetMemSetFailed(e.to_string()));
+        }
         Ok(())
     }
 
@@ -242,4 +277,16 @@ pub fn is_cgroup_procs_writable() -> bool {
         .unwrap_or_default()
         .0
         .ge(MIN_KERNEL_VERSION_CGROUP_PROCS)
+}
+
+pub fn get_cgroup_cpuset(dir_path: &str) -> Result<[String; 2], io::Error> {
+    let cpuset_cpus = match fs::read_to_string(format!("{}/cpuset.cpus", dir_path)) {
+        Ok(file_contents) => file_contents,
+        Err(e) => return Err(e),
+    };
+    let cpuset_mems = match fs::read_to_string(format!("{}/cpuset.mems", dir_path)) {
+        Ok(file_contents) => file_contents,
+        Err(e) => return Err(e),
+    };
+    Ok([cpuset_cpus, cpuset_mems])
 }
