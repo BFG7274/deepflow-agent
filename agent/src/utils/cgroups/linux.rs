@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -36,9 +37,11 @@ pub struct Cgroups {
     cgroup: Cgroup,
     mount_path: String,
     is_v2: bool,
+    cpuset_dir: String,
 }
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const CPUSET_DIR: [&str; 4] = ["", "", "", ""];
 
 impl Cgroups {
     /// 创建cgroup hierarchy
@@ -89,7 +92,16 @@ impl Cgroups {
                 )));
             }
         };
-
+        let mut cpuset_dir = String::new();
+        for dir in CPUSET_DIR {
+            if Path::new(dir).exists() {
+                cpuset_dir = dir.to_string();
+                break;
+            }
+        }
+        if cpuset_dir.len() == 0 {
+            return Err(Error::GetCgroupFailed("empty".to_string()));
+        }
         if !is_cgroup_procs_writable() {
             // In kernel versions before Linux 3.0, we use add_task method, write thread id to the tasks file
             if let Err(e) = cpus.add_task(&CgroupPid::from(pid)) {
@@ -124,6 +136,7 @@ impl Cgroups {
             cgroup: cg,
             mount_path: hierarchies::auto().root().to_str().unwrap().to_string(),
             is_v2,
+            cpuset_dir,
         })
     }
 
@@ -150,6 +163,8 @@ impl Cgroups {
         let mut last_cpu = 0;
         let mut last_memory = 0;
         let cgroup = self.cgroup.clone();
+        let mut last_cpuset_cpus = String::new();
+        let mut last_cpuset_mems = String::new();
         let thread = thread::Builder::new()
             .name("cgroups-controller".to_owned())
             .spawn(move || {
@@ -157,8 +172,27 @@ impl Cgroups {
                     let environment = environment_config.load();
                     let max_cpus = environment.max_cpus;
                     let max_memory = environment.max_memory;
-                    if max_cpus != last_cpu || max_memory != last_memory {
-                        if let Err(e) = Self::apply(cgroup.clone(), max_cpus, max_memory) {
+                    let [max_cpuset_cpus, max_cpuset_mems] =
+                        match get_cgroup_cpuset(&self.cpuset_dir) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                warn!("get cpuset data failed, {}, deepflow-agent restart...", e);
+                                thread::sleep(Duration::from_secs(1));
+                                process::exit(1);
+                            }
+                        };
+                    if max_cpus != last_cpu
+                        || max_memory != last_memory
+                        || max_cpuset_cpus != last_cpuset_cpus
+                        || max_cpuset_mems != last_cpuset_mems
+                    {
+                        if let Err(e) = Self::apply(
+                            cgroup.clone(),
+                            max_cpus,
+                            max_memory,
+                            &max_cpuset_cpus,
+                            &max_cpuset_mems,
+                        ) {
                             warn!(
                                 "apply cgroups resource failed, {}, deepflow-agent restart...",
                                 e
@@ -169,6 +203,8 @@ impl Cgroups {
                     }
                     last_cpu = max_cpus;
                     last_memory = max_memory;
+                    last_cpuset_cpus = max_cpuset_cpus;
+                    last_cpuset_mems = max_cpuset_mems;
 
                     let (running, timer) = &*running;
                     let mut running = running.lock().unwrap();
@@ -189,7 +225,13 @@ impl Cgroups {
     }
 
     /// 更改资源限制
-    pub fn apply(cgroup: Cgroup, max_cpus: u32, max_memory: u64) -> Result<(), Error> {
+    pub fn apply(
+        cgroup: Cgroup,
+        max_cpus: u32,
+        max_memory: u64,
+        max_cpuset_cpus: &str,
+        max_cpuset_mems: &str,
+    ) -> Result<(), Error> {
         let mut resources = Resources::default();
         let cpu_quota = max_cpus * DEFAULT_CPU_CFS_PERIOD_US;
         let cpu_resources = CpuResources {
@@ -208,12 +250,6 @@ impl Cgroups {
             return Err(Error::ApplyResourcesFailed(e.to_string()));
         }
 
-        let cpuset_data = match get_cgroup_cpuset("") {
-            Ok(data) => data,
-            Err(e) => {
-                return Err(Error::GetCgroupFailed(e.to_string()));
-            }
-        };
         let cpuset: &cpuset::CpuSetController = match cgroup.controller_of() {
             Some(controller) => controller,
             None => {
@@ -222,10 +258,10 @@ impl Cgroups {
                 )));
             }
         };
-        if let Err(e) = cpuset.set_mems(&cpuset_data[1].trim()) {
+        if let Err(e) = cpuset.set_mems(max_cpuset_mems) {
             return Err(Error::CpusetMemSetFailed(e.to_string()));
         }
-        if let Err(e) = cpuset.set_cpus(&cpuset_data[0].trim()) {
+        if let Err(e) = cpuset.set_cpus(max_cpuset_cpus) {
             return Err(Error::CpusetMemSetFailed(e.to_string()));
         }
         Ok(())
@@ -281,11 +317,11 @@ pub fn is_cgroup_procs_writable() -> bool {
 
 pub fn get_cgroup_cpuset(dir_path: &str) -> Result<[String; 2], io::Error> {
     let cpuset_cpus = match fs::read_to_string(format!("{}/cpuset.cpus", dir_path)) {
-        Ok(file_contents) => file_contents,
+        Ok(file_contents) => file_contents.trim().to_string(),
         Err(e) => return Err(e),
     };
     let cpuset_mems = match fs::read_to_string(format!("{}/cpuset.mems", dir_path)) {
-        Ok(file_contents) => file_contents,
+        Ok(file_contents) => file_contents.trim().to_string(),
         Err(e) => return Err(e),
     };
     Ok([cpuset_cpus, cpuset_mems])
